@@ -36,8 +36,13 @@ ENVS=(
   -e "SGLANG_MTP_FP8_HEAD=${MTP_FP8_HEAD:-1}"          # FP8 copy of the drafter-only lm_head
   -e "SGLANG_PREFILL_POOL_GB=${PREFILL_POOL_GB:-6}"    # reserve prefill activations before RAM fragments
   -e "SGLANG_FAKE_VERIFY_CTX_FILE=${FAKE_VERIFY_CTX_FILE:-1}"  # bench/longctx-decode.sh switch (inert by default)
+  -e "SGLANG_MXFP4_PREFILL_MOE=${MXFP4_PREFILL_MOE:-1}"  # prefill-sized MoE GEMMs on Marlin's MXFP4 weights (patch 12)
+  -e "SGLANG_FI_FULL_PREFILL=${FI_FULL_PREFILL:-1}"      # FlashInfer FA2 for the full-attention layers' prefill
   -e "NCCL_SOCKET_IFNAME=$SOCKET_IFNAME" -e "GLOO_SOCKET_IFNAME=$SOCKET_IFNAME"
   -e "NCCL_IB_HCA=$NCCL_IB_HCA" -e "NCCL_IB_GID_INDEX=$IB_GID_INDEX" -e NCCL_DEBUG=WARN
+  # NCCL now only carries prefill's large all-reduces (96 MB per 8K-token chunk): Simple protocol on 8 channels
+  # is 6.8 ms vs 7.9 ms with NCCL's defaults (bench/arbench.py).
+  -e "NCCL_PROTO=${NCCL_PROTO:-Simple}" -e "NCCL_MIN_NCHANNELS=${NCCL_CHANNELS:-8}" -e "NCCL_MAX_NCHANNELS=${NCCL_CHANNELS:-8}"
 )
 for kv in ${EXTRA_ENV:-}; do ENVS+=(-e "$kv"); done
 

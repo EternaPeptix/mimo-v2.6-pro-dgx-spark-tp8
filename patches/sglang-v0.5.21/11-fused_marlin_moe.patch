@@ -1,0 +1,213 @@
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py
+@@ -1,5 +1,7 @@
+ from typing import Optional
+ 
++import os
++
+ import torch
+ import torch.nn.functional as F
+ import triton
+@@ -131,6 +133,10 @@
+     output.copy_(gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1))
+ 
+ 
++# Use the prefill GEMMs from this many (token, expert) rows per expert on average (~1K tokens for 384 experts, top-8).
++_MXFP4_PREFILL_MIN_ROWS_PER_EXPERT = 20
++
++
+ @register_custom_op(out_shape="hidden_states")
+ def fused_marlin_moe(
+     hidden_states: torch.Tensor,
+@@ -235,11 +241,34 @@
+     topk = topk_ids.shape[1]
+     gemm1_n = 2 * N if is_gated else N
+ 
++    # Large batches (prefill chunks): Triton GEMMs that read Marlin's MXFP4 layout but decode each expert tile
++    # once per 64-token block and run BF16 tensor-core MMAs (kernels/ops/moe/mxfp4_marlin_prefill.py); ~1.4x
++    # Marlin for an 8K-token chunk on GB10. Decode-sized batches keep Marlin. SGLANG_MXFP4_PREFILL_MOE=0 disables.
++    use_prefill_gemm = (
++        is_mxfp4_marlin
++        and is_gated
++        and expert_map is None
++        and w1_bias is None
++        and w2_bias is None
++        and (g_idx1 is None or g_idx1.numel() == 0)
++        and (g_idx2 is None or g_idx2.numel() == 0)
++        and topk_weights.dtype == torch.float32
++        and topk_weights.is_contiguous()
++        and M * topk >= _MXFP4_PREFILL_MIN_ROWS_PER_EXPERT * E
++        and os.environ.get("SGLANG_MXFP4_PREFILL_MOE", "1") == "1"
++    )
++    if use_prefill_gemm:
++        from sglang.kernels.ops.moe import mxfp4_marlin_prefill
++
++        use_prefill_gemm = mxfp4_marlin_prefill.supports(w1) and mxfp4_marlin_prefill.supports(w2)
++
+     # M block size selection logic
+     # TODO: tune this further for specific models
+     for block_size_m in [8, 16, 32, 48, 64]:
+         if M * topk / E / block_size_m < 0.9:
+             break
++    if use_prefill_gemm:
++        block_size_m = mxfp4_marlin_prefill.BLOCK_M
+ 
+     if global_num_experts == -1:
+         global_num_experts = E
+@@ -286,8 +315,16 @@
+         device=hidden_states.device,
+         dtype=hidden_states.dtype,
+     )
+-    # Marlin skips masked expert rows, so their shared cache must start at zero.
+-    intermediate_cache13 = torch.zeros(
++    # Marlin skips masked expert rows, so their shared cache must start at zero. Without expert
++    # parallelism nothing is masked: every (token, k) row of both GEMM outputs is written (and the MXFP4
++    # path never accumulates atomically), so the zero fill -- M*topk*K elements, 805 MB per layer for an
++    # 8K-token prefill chunk -- is skipped. SGLANG_MARLIN_MOE_ZERO_FILL=1 restores it.
++    _needs_zero = (
++        expert_map is not None
++        or os.environ.get("SGLANG_MARLIN_MOE_ZERO_FILL", "0") == "1"
++        or not is_mxfp4_marlin
++    )
++    intermediate_cache13 = (torch.zeros if _needs_zero else torch.empty)(
+         (M * topk_ids.shape[1] * max(gemm1_n, K),),
+         device=hidden_states.device,
+         dtype=hidden_states.dtype,
+@@ -302,34 +339,40 @@
+         or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
+     ) and (not is_mxfp4_marlin)
+ 
+-    intermediate_cache1 = moe_wna16_marlin_gemm(
+-        hidden_states,
+-        intermediate_cache1,
+-        w1,
+-        w1_bias,
+-        w1_scale,
+-        w1_global_scale,
+-        w1_zeros,
+-        g_idx1,
+-        sort_indices1,
+-        workspace,
+-        sorted_token_ids,
+-        expert_ids,
+-        num_tokens_post_padded,
+-        topk_weights,
+-        moe_block_size=block_size_m,
+-        top_k=topk,
+-        mul_topk_weights=False,
+-        is_ep=expert_map is not None,
+-        b_q_type=scalar_type1,
+-        size_m=M,
+-        size_n=gemm1_n,
+-        size_k=K,
+-        is_k_full=is_k_full,
+-        use_atomic_add=use_atomic_add,
+-        use_fp32_reduce=True,
+-        is_zp_float=False,
+-    )
++    if use_prefill_gemm:
++        mxfp4_marlin_prefill.mxfp4_marlin_moe_gemm(
++            hidden_states, w1, w1_scale, intermediate_cache1, topk_weights,
++            sorted_token_ids, expert_ids, num_tokens_post_padded, topk, False,
++        )
++    else:
++        intermediate_cache1 = moe_wna16_marlin_gemm(
++            hidden_states,
++            intermediate_cache1,
++            w1,
++            w1_bias,
++            w1_scale,
++            w1_global_scale,
++            w1_zeros,
++            g_idx1,
++            sort_indices1,
++            workspace,
++            sorted_token_ids,
++            expert_ids,
++            num_tokens_post_padded,
++            topk_weights,
++            moe_block_size=block_size_m,
++            top_k=topk,
++            mul_topk_weights=False,
++            is_ep=expert_map is not None,
++            b_q_type=scalar_type1,
++            size_m=M,
++            size_n=gemm1_n,
++            size_k=K,
++            is_k_full=is_k_full,
++            use_atomic_add=use_atomic_add,
++            use_fp32_reduce=True,
++            is_zp_float=False,
++        )
+ 
+     if activation == "silu" and is_gated and gemm1_alpha is not None:
+         if clamp_limit is None:
+@@ -365,34 +408,40 @@
+     if expert_map is not None:
+         intermediate_cache3.zero_()
+ 
+-    intermediate_cache3 = moe_wna16_marlin_gemm(
+-        intermediate_cache2,
+-        intermediate_cache3,
+-        w2,
+-        w2_bias,
+-        w2_scale,
+-        w2_global_scale,
+-        w2_zeros,
+-        g_idx2,
+-        sort_indices2,
+-        workspace,
+-        sorted_token_ids,
+-        expert_ids,
+-        num_tokens_post_padded,
+-        topk_weights,
+-        moe_block_size=block_size_m,
+-        top_k=1,
+-        mul_topk_weights=True,
+-        is_ep=expert_map is not None,
+-        b_q_type=scalar_type2,
+-        size_m=M * topk,
+-        size_n=K,
+-        size_k=N,
+-        is_k_full=is_k_full,
+-        use_atomic_add=use_atomic_add,
+-        use_fp32_reduce=True,
+-        is_zp_float=False,
+-    ).view(-1, topk, K)
++    if use_prefill_gemm:
++        intermediate_cache3 = mxfp4_marlin_prefill.mxfp4_marlin_moe_gemm(
++            intermediate_cache2, w2, w2_scale, intermediate_cache3, topk_weights,
++            sorted_token_ids, expert_ids, num_tokens_post_padded, topk, True,
++        ).view(-1, topk, K)
++    else:
++        intermediate_cache3 = moe_wna16_marlin_gemm(
++            intermediate_cache2,
++            intermediate_cache3,
++            w2,
++            w2_bias,
++            w2_scale,
++            w2_global_scale,
++            w2_zeros,
++            g_idx2,
++            sort_indices2,
++            workspace,
++            sorted_token_ids,
++            expert_ids,
++            num_tokens_post_padded,
++            topk_weights,
++            moe_block_size=block_size_m,
++            top_k=1,
++            mul_topk_weights=True,
++            is_ep=expert_map is not None,
++            b_q_type=scalar_type2,
++            size_m=M * topk,
++            size_n=K,
++            size_k=N,
++            is_k_full=is_k_full,
++            use_atomic_add=use_atomic_add,
++            use_fp32_reduce=True,
++            is_zp_float=False,
++        ).view(-1, topk, K)
+ 
+     output = zero_copy_context.get_moe_output(hidden_states)
+     if output is None:

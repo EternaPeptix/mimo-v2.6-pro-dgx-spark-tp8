@@ -54,7 +54,25 @@
  
          # Parse args
          self.skip_prefill = skip_prefill
-@@ -238,6 +265,26 @@
+@@ -212,6 +239,17 @@
+         # Lets the Triton wrappers specialize on PAGE_SIZE; page_size=1 is
+         # byte-identical to the slot-based envelope.
+         self.page_size = getattr(model_runner, "page_size", 1) or 1
++        # Full-attention prefill (plain causal EXTEND batches) through FlashInfer's FA2 paged kernel: ~65 vs
++        # 36-50 TFLOPS for MiMo's 192/128 head dims on GB10 at long prefixes. Sliding-window/sink layers, verify
++        # and draft passes stay on the Triton kernels. Planned once per batch in init_forward_metadata.
++        self.fi_full_prefill = os.environ.get("SGLANG_FI_FULL_PREFILL", "0") == "1"
++        self._fi_wrapper = None
++        self._fi_args = None
++        self._fi_planned = None
++        # SGLANG_FI_FULL_PREFILL_CHECK=N: also run the Triton kernel for the first N FlashInfer calls and log the
++        # relative difference (start-up self-test of the page mapping).
++        self._fi_check_left = int(os.environ.get("SGLANG_FI_FULL_PREFILL_CHECK", "0"))
++        self._fi_diag_left = 2 if self._fi_check_left > 0 else 0
+         self.kv_index_translator = model_runner.kv_index_translator
+         self.num_draft_tokens = get_spec().speculative_num_draft_tokens
+         self.dllm_block_size = (
+@@ -238,6 +276,26 @@
              self.use_mla,
              self.use_verify_splitkv,
          )
@@ -81,7 +99,7 @@
          # TODO: this logic should be fixed in non-hip platform
          self.is_hip_dspark_draft = (
              _is_hip
-@@ -584,6 +631,15 @@
+@@ -584,6 +642,15 @@
          kv_indptr = self._fill_kv_indptr_and_indices(
              bs, seq_lens, req_pool_indices, self.cuda_graph_kv_indices
          )
@@ -97,7 +115,7 @@
          window_kv_indptr = self.window_kv_indptr
          window_kv_indices = None
          window_num_kv_splits = None
-@@ -696,6 +752,20 @@
+@@ -696,6 +763,20 @@
          kv_indptr = self._fill_kv_indptr_and_indices(
              bs, kv_lens, req_pool_indices, self.cuda_graph_kv_indices
          )
@@ -118,7 +136,30 @@
          return qo_indptr, kv_indptr, num_tokens_per_req
  
      def init_forward_metadata_out_graph(
-@@ -1296,8 +1366,10 @@
+@@ -811,6 +892,8 @@
+         """Init auxiliary variables for triton attention backend."""
+ 
+         self._dense_one_shot_kv_indptr = None
++        self._fi_args = None
++        self._fi_planned = None
+         bs = forward_batch.batch_size
+         window_kv_indptr = self.window_kv_indptr
+         window_kv_indices = None
+@@ -1031,6 +1114,13 @@
+             else:
+                 max_extend_len = int(forward_batch.extend_seq_lens.max())
+             num_kv_splits = None
++            if (
++                self.fi_full_prefill
++                and forward_batch.forward_mode == ForwardMode.EXTEND
++                and self.dcp_size == 1
++                and not os.path.exists("/tmp/fi_prefill_off")  # A/B switch for benchmarking (per rank)
++            ):
++                self._fi_prepare(forward_batch, bs)
+ 
+         swa_out_cache_loc = None
+         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
+@@ -1296,8 +1386,10 @@
                  qo_indptr=self.qo_indptr[: bs + 1],
                  custom_mask=None,
                  mask_indptr=None,
@@ -131,7 +172,153 @@
                  window_num_kv_splits=None,
                  window_kv_offsets=None,
                  swa_out_cache_loc=swa_out_cache_loc,
-@@ -1755,6 +1827,33 @@
+@@ -1572,6 +1664,81 @@
+                 layer, loc, k, v, k_scale, v_scale, **kwargs
+             )
+ 
++    def _fi_prepare(self, forward_batch: ForwardBatch, bs: int):
++        """Paged-KV view (whole sequences: prefix + this chunk) of the batch for FlashInfer.
++
++        Token ids come from the same read stream the Triton kernels use; with page_size P the P tokens of a page
++        are contiguous and page-aligned, so every P-th id // P is the page id."""
++        ps = self.page_size
++        # host copies of the lengths (one sync per prefill batch when the scheduler did not provide them)
++        seq_cpu = forward_batch.seq_lens_cpu
++        seq = [int(x) for x in (seq_cpu if seq_cpu is not None else forward_batch.seq_lens)[:bs].tolist()]
++        ext_cpu = forward_batch.extend_seq_lens_cpu
++        ext = [int(x) for x in (ext_cpu if ext_cpu is not None else forward_batch.extend_seq_lens[:bs].tolist())[:bs]]
++        tok_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=self.device)
++        tok_indptr[1:] = torch.cumsum(forward_batch.seq_lens[:bs], dim=0)
++        tok = torch.empty(sum(seq), dtype=torch.int64, device=self.device)
++        self.kv_index_translator.fill_packed_read_stream(
++            req_pool_indices=forward_batch.req_pool_indices[:bs],
++            seq_lens=forward_batch.seq_lens[:bs],
++            indptr=tok_indptr,
++            total_tokens=tok.numel(),
++            out=tok,
++        )
++        pages, start = [], 0
++        for n in seq:
++            pages.append(tok[start : start + n : ps])
++            start += n
++        kv_page_indices = (torch.cat(pages) // ps).to(torch.int32)
++        npages = [(n + ps - 1) // ps for n in seq]
++        kv_page_indptr = torch.zeros(bs + 1, dtype=torch.int32)
++        kv_page_indptr[1:] = torch.cumsum(torch.tensor(npages, dtype=torch.int32), 0)
++        last_page_len = torch.tensor([n - (m - 1) * ps for n, m in zip(seq, npages)], dtype=torch.int32)
++        qo_indptr = torch.zeros(bs + 1, dtype=torch.int32)
++        qo_indptr[1:] = torch.cumsum(torch.tensor(ext, dtype=torch.int32), 0)
++        self._fi_args = (qo_indptr, kv_page_indptr, kv_page_indices, last_page_len)
++
++    def _fi_full_attention(self, q: torch.Tensor, o: torch.Tensor, layer: RadixAttention) -> bool:
++        ps = self.page_size
++        k_buf = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
++        v_buf = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
++        if (
++            k_buf.dtype != q.dtype
++            or v_buf.dtype != q.dtype
++            or k_buf.shape[0] % ps
++            or v_buf.shape[0] % ps
++            or not k_buf.is_contiguous()
++            or not v_buf.is_contiguous()
++            or not o.is_contiguous()
++        ):
++            return False
++        key = (layer.tp_q_head_num, layer.tp_k_head_num, layer.qk_head_dim, layer.v_head_dim, float(layer.scaling))
++        if self._fi_planned != key:
++            if self._fi_wrapper is None:
++                import flashinfer
++
++                self._fi_workspace = torch.empty(256 << 20, dtype=torch.uint8, device=self.device)
++                self._fi_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
++                    self._fi_workspace, kv_layout="NHD", backend="fa2"
++                )
++            qo_indptr, kv_page_indptr, kv_page_indices, last_page_len = self._fi_args
++            self._fi_wrapper.plan(
++                qo_indptr, kv_page_indptr, kv_page_indices, last_page_len,
++                layer.tp_q_head_num, layer.tp_k_head_num, layer.qk_head_dim, ps,
++                causal=True, head_dim_vo=layer.v_head_dim, q_data_type=q.dtype, kv_data_type=k_buf.dtype,
++                sm_scale=layer.scaling,
++            )
++            self._fi_planned = key
++        self._fi_wrapper.run(
++            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
++            (
++                k_buf.view(-1, ps, layer.tp_k_head_num, layer.qk_head_dim),
++                v_buf.view(-1, ps, layer.tp_k_head_num, layer.v_head_dim),
++            ),
++            out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
++        )
++        return True
++
+     def forward_extend(
+         self,
+         q: torch.Tensor,
+@@ -1715,6 +1882,63 @@
+                 aux_tensors=aux_tensors,
+             )
+ 
++        if (
++            self.fi_full_prefill
++            and self._fi_diag_left > 0
++            and forward_batch.forward_mode == ForwardMode.EXTEND
++            and (layer.sliding_window_size is None or layer.sliding_window_size <= -1)
++        ):
++            self._fi_diag_left -= 1
++            print(f"[fi-full-prefill diag] layer {layer.layer_id}: planned={self._fi_args is not None} "
++                  f"causal={causal} sinks={sinks is not None} score_mod={score_mod is not None} "
++                  f"soft_cap={logits_soft_cap} k_scale={getattr(layer, 'k_scale_float', None)} "
++                  f"v_scale={getattr(layer, 'v_scale_float', None)} xai={layer.xai_temperature_len} "
++                  f"custom_mask={self.forward_metadata.custom_mask is not None} q={tuple(q.shape)} "
++                  f"heads={layer.tp_q_head_num}/{layer.tp_k_head_num} dims={layer.qk_head_dim}/{layer.v_head_dim}",
++                  flush=True)
++        if (
++            self._fi_args is not None
++            and causal
++            and (layer.sliding_window_size is None or layer.sliding_window_size <= -1)
++            and sinks is None
++            and score_mod is None
++            and aux_tensors is None
++            and not logits_soft_cap
++            and (layer.k_scale is None or (layer.k_scale_float == 1.0 and layer.v_scale_float == 1.0))
++            and (layer.xai_temperature_len is None or layer.xai_temperature_len <= 0)
++            and self.forward_metadata.custom_mask is None
++            and self._fi_full_attention(q, o, layer)
++        ):
++            if self._fi_check_left > 0:
++                self._fi_check_left -= 1
++                o_ref = torch.empty_like(o)
++                self.extend_attention_fwd(
++                    q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
++                    k.contiguous(),
++                    v.contiguous(),
++                    o_ref.view(-1, layer.tp_q_head_num, layer.v_head_dim),
++                    self.token_to_kv_pool.get_key_buffer(layer.layer_id),
++                    self.token_to_kv_pool.get_value_buffer(layer.layer_id),
++                    self.forward_metadata.qo_indptr,
++                    self.forward_metadata.kv_indptr,
++                    self.forward_metadata.kv_indices,
++                    None,
++                    True,
++                    None,
++                    self.forward_metadata.max_extend_len,
++                    1.0,
++                    1.0,
++                    layer.scaling,
++                    page_size=self.page_size,
++                    extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
++                )
++                ref = o_ref.float()
++                diff = ((o.float() - ref).abs().max() / ref.abs().max().clamp_min(1e-6)).item()
++                print(f"[fi-full-prefill check] layer {layer.layer_id} tokens {q.shape[0]} "
++                      f"prefix {self._fi_args[1][-1].item() * self.page_size - q.shape[0]}: "
++                      f"max|FI-Triton|/max|Triton| = {diff:.2e}", flush=True)
++            return o
++
+         # Normal mode: use original 2-stage kernel
+         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+             bidirectional_extend = (
+@@ -1755,6 +1979,33 @@
          else:
              verify_fwd = None
          if (

@@ -88,6 +88,13 @@ build on one node and stream it to the others instead (~8 min each, over the fab
 ssh -A spark-2 'docker save mimo-gb10:v0.5.21 | ssh 10.77.0.11 docker load'
 ```
 
+Then compile FlashInfer's prefill kernel for MiMo's head dims into every node's JIT cache (otherwise the first
+long prompt after a launch waits ~1–2 min while all 8 ranks compile it at once):
+
+```bash
+scripts/warm-flashinfer.sh   # needs the GPU: run it while the server is stopped
+```
+
 Optional, but a good check that the fabric and the RDMA extension work (stop any running server first):
 
 ```bash
@@ -106,7 +113,13 @@ What the launcher does (see `scripts/mimo-tp8.sh`): TP8 across the 8 nodes, Marl
 attention, multi-layer EAGLE with the built-in MTP layers (3 draft steps, top-1, 4 verified tokens),
 1,048,576-token context, a 1.11M-token full-attention KV pool and a small sliding-window pool, page size 64,
 plus the feature switches from [OPTIMIZATIONS.md](OPTIMIZATIONS.md) (all on by default; each can be turned
-off with an env var, e.g. `RDMA_AR=0 scripts/launch-all.sh`).
+off with an env var, e.g. `RDMA_AR=0 scripts/launch-all.sh`). The prefill ones are `MXFP4_PREFILL_MOE`
+(prefill MoE GEMMs), `FI_FULL_PREFILL` (FlashInfer for the full-attention layers) and `NCCL_PROTO` /
+`NCCL_CHANNELS` (defaults `Simple` / 8, for prefill's large all-reduces).
+
+Keep other GPU services off the 8 nodes. In particular, a container with a `--restart` policy that crash-loops
+while the server holds the memory will come up in the gap between a stop and the next launch, and the launch
+then fails with "The memory capacity is unbalanced" (see [PITFALLS.md](PITFALLS.md)).
 
 Triton/JIT caches persist in `~/.cache/mimo-gb10-jit` on each node, so later starts skip most compilation.
 
@@ -128,7 +141,13 @@ curl -s localhost:30000/v1/chat/completions -H 'Content-Type: application/json' 
 ```bash
 bench/run-bench.sh             # code / math / essay prompts: tok/s, MTP acceptance, ms per verify step
 bench/longctx-decode.sh        # step time at 0 / 128K / 256K / 512K / 1M context (no long prefill)
+bench/prefill-ttft.sh 32768 3  # time to first token of a ~31K-token prompt (FI_AB=1: also without FlashInfer)
+ssh spark-1 "python3 - 120000 1" < bench/needle.py   # long-context retrieval check (5 facts at 5 depths)
 ```
+
+Kernel-level tests and micro-benchmarks are in the image under `/opt/mimo-gb10/tests` (run them on a node
+whose server is stopped), e.g.
+`docker run --rm --gpus all mimo-gb10:v0.5.21 python3 /opt/mimo-gb10/tests/test_mxfp4_prefill_moe.py`.
 
 See [RESULTS.md](RESULTS.md) for what to expect and how to read the numbers.
 

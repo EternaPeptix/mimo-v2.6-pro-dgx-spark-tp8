@@ -85,13 +85,58 @@ Same benchmark, as changes were added (step times when no compaction was happeni
 | + FP8 draft lm_head | ~53 ms | ~61 |
 | + `vm.compaction_proactiveness=0` | **53 ms in every run** (was bimodal 53 / 70–77) | **~61** |
 
-## Prefill (not optimized yet)
+## Prefill
 
-| Prompt | Time to first token |
+One long prompt at a time, greedy, a random nonce first so nothing comes from the prefix cache; the first
+request after a launch compiles kernels and is not counted.
+
+| Prompt | Measured | Prefill rate |
+|---|---|---|
+| 31K tokens (`bench/prefill-ttft.sh`) | time to first token **14.3 s** | ~2.2K tok/s |
+| 53K tokens (`bench/needle.py`) | **27.3 s** for prefill + a ~50-token answer (27.1–27.6) | ~2.0K tok/s |
+| 120K tokens (`bench/needle.py`) | **66.0 s** for prefill + answer | ~1.8K tok/s |
+
+The retrieval check (5 facts hidden at 2–97% depth) recalled 15/15 at 53K and 5/5 at 120K.
+
+How the 31K-token time to first token moved (warm, 3 runs each, all on the same cluster):
+
+| Build | TTFT |
 |---|---|
-| 62K tokens, warm caches | 83–150 s |
-| 247K tokens | 881 s |
+| Decode-optimized release (previous version of this repository) | 19.6 s |
+| + sliding-window prefill loop start, no MoE scratch zero-fill, NCCL Simple / 8 channels | 16.8 s |
+| + prefill MoE GEMMs on Marlin's MXFP4 layout | 14.7 s |
+| + FlashInfer for the full-attention layers | **14.3 s** |
 
-Prefill attention is bandwidth-bound at ~33 TFLOPS on GB10 even with the larger tiles, the prefill MoE uses
-Marlin (built for small batches), and long prefills are the most exposed to stragglers. This is the next
-thing we are working on.
+FlashInfer's share grows with context: at 53K tokens it took the prompt from 28.7 to 27.3 s, and one
+full-attention layer's 8K chunk against a 131K prefix takes 173 instead of 315 ms. Decode is unchanged by
+all of this (53.0–53.7 ms per verify step).
+
+Where an 8K-token chunk's time goes (rank 0 trace of two consecutive chunks of a 31K-token prompt, before
+the FlashInfer change):
+
+| Part | Share |
+|---|---|
+| TP all-reduces (NCCL ring, 150 × 96 MB per chunk) | 28.5% |
+| MoE GEMMs (the new prefill kernels) | 28.4% |
+| Attention (10 full + 60 sliding-window layers) | 17.3% |
+| qkv projections (Triton block-FP8 W8A8, ~79 TFLOPS) | 10.4% |
+| top-k sum of expert outputs, o_proj (BF16), router, SiLU, norms, ... | ~15% |
+
+Estimated from these per-chunk costs (not measured): a 1M-token prompt would take ~20–25 minutes, about two
+thirds of it in full attention (~5.6·10¹⁶ FLOPs per rank at ~65 TFLOPS).
+
+## GB10 reference numbers
+
+Measured on one Spark, for scale:
+
+| | |
+|---|---|
+| cuBLAS BF16 GEMM, M = 4K–16K | 84–90 TFLOPS |
+| cuBLAS FP8 e4m3 GEMM, per-tensor scales | 160–181 TFLOPS |
+| Triton block-scaled (128×128) FP8 GEMM at the qkv shape | ~79 TFLOPS |
+| 1 GiB device-to-device copy | 227 GB/s (read + write) |
+| L2 / SMs / shared memory per block | 24 MB / 48 / 99 KB |
+
+The "1 PFLOP" in DGX Spark's specifications is FP4 with 2:4 structured sparsity. This deployment's prefill
+math runs on BF16 tensor cores: the FP4 expert weights are decoded to exact BF16 values and activations are
+not quantized. FP8 activations would roughly double the MoE math rate, at an accuracy cost we have not taken.

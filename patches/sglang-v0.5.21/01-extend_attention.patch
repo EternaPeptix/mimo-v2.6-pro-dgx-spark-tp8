@@ -23,3 +23,18 @@
      if _is_gfx95 and Lq == 192 and Lv == 128:
          return 2
      if (
+@@ -672,7 +679,13 @@
+         else tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
+     )
+     extend_end = 0 if SKIP_EXTEND else cur_block_m_end
+-    for start_n in range(0, extend_end, BLOCK_N):
++    # Sliding window: keys more than SLIDING_WINDOW_SIZE before this query block are masked for every
++    # row, so start the loop at the first tile that can be visible instead of walking (and skipping)
++    # every earlier tile of the chunk. Only for the plain causal case (no custom mask).
++    extend_start = 0
++    if SLIDING_WINDOW_SIZE > 0 and IS_CAUSAL and not USE_CUSTOM_MASK:
++        extend_start = tl.maximum(cur_block_m * BLOCK_M - SLIDING_WINDOW_SIZE, 0) // BLOCK_N * BLOCK_N
++    for start_n in range(extend_start, extend_end, BLOCK_N):
+         start_n = tl.multiple_of(start_n, BLOCK_N)
+         mask_n = (start_n + offs_n) < cur_block_m_end
+ 

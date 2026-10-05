@@ -39,7 +39,8 @@ backed by 2 MB huge pages for the same reason.
 GPUDirect RDMA is reported disabled on GB10 (`NET/IB : GPU Direct RDMA Disabled`), NCCL chooses ring/LL for
 small messages, and every hop goes through its CPU proxy: ~95–115 µs eager and 130–190 µs inside CUDA
 graphs for 12–48 KB across 8 nodes. Tree/LL is no better. That is why `kernels/rdma_ar` exists. NCCL is still
-used for large messages (prefill), where its ring is bandwidth-efficient (96 MB in ~8 ms).
+used for large messages (prefill), where its ring is bandwidth-efficient: 96 MB in ~7.9 ms with NCCL's
+defaults, 6.8 ms with `NCCL_PROTO=Simple` and exactly 8 channels (the launcher's default).
 
 ## 4. The torch profiler distorts CUDA-graph launches
 
@@ -57,14 +58,28 @@ With TP each rank streams all 566 GB of safetensors and keeps 1/8, so a cold sta
 
 The first long prompt after a start triggers Triton JIT compilation (we saw a 92 s first prefill chunk).
 `scripts/mimo-tp8.sh` persists `/root/.triton` and `/root/.cache` to `~/.cache/mimo-gb10-jit` on each node,
-which also cuts CUDA-graph capture from ~3.5 to ~1 minute on later starts.
+which also cuts CUDA-graph capture from ~3.5 to ~1 minute on later starts. FlashInfer's prefill kernel is
+compiled on first use too (~1–2 min with 8 ranks at once): `scripts/warm-flashinfer.sh` builds it into that
+cache ahead of time. Even warm, the first long prompt after a launch is ~3 s slower than the next ones.
 
 ## 7. The radix cache flatters repeated long prompts
 
 Re-sending a long prompt that shares a prefix with an earlier one skips most of the prefill. `bench/bench.py`
 puts a random nonce at the start of every long prompt.
 
-## 8. Smaller things
+## 8. Other GPU services that restart themselves
+
+**Symptom.** A launch that worked before fails on every rank with "The memory capacity is unbalanced. Some GPUs
+may be occupied by other processes", or one rank shows ~20 GB less free memory than the others.
+
+**Cause.** Another inference container on one node with a `--restart unless-stopped` (or `always`) policy. While
+our server holds the memory it crash-loops (its restart count keeps climbing); in the few minutes between
+stopping the server and the next launch it finally starts and keeps its memory.
+
+**Fix.** Keep other GPU services off the 8 nodes while this runs, or `docker update --restart=no <name>` them for
+the duration; check `nvidia-smi --query-compute-apps=pid,used_memory --format=csv` on every node before launching.
+
+## 9. Smaller things
 
 - `pkill -f <pattern>` inside `ssh host '...'` matches the remote shell running that very command and kills
   your session (exit 255). Anchor the pattern, e.g. `pkill -f "^python3 /path/script.py"`.
@@ -74,3 +89,11 @@ puts a random nonce at the start of every long prompt.
   the host.
 - The long-context measurement switch is re-read every 32 verify steps, so the request right after you turn
   it off still decodes a few steps in measurement mode and continues from that text.
+- In this SGLang build's GPU-only scheduling path, `ForwardBatch.seq_lens_cpu` / `extend_seq_lens_cpu` can be
+  `None`. Anything that plans on the host (FlashInfer's `plan()`) has to fall back to the device tensors
+  (one sync per prefill batch); our first FlashInfer integration silently never ran because of this.
+- FP8 checkpoints give every attention layer `k_scale` / `v_scale` tensors equal to 1.0, not `None`: gate on
+  the values (`k_scale_float == 1.0`), not on presence.
+- Nsight Compute ships in the image and works on GB10 with `docker run --cap-add SYS_ADMIN ... ncu
+  --kernel-name regex:<kernel> --launch-skip 1 --launch-count 1 python3 <test>`; the DRAM byte counters are not
+  available on this unified-memory part, but occupancy, issue and stall statistics are.
