@@ -1,0 +1,25 @@
+--- a/python/sglang/kernels/ops/attention/extend_attention.py
++++ b/python/sglang/kernels/ops/attention/extend_attention.py
+@@ -99,7 +99,12 @@
+             BLOCK_M, BLOCK_N = (64, 64)
+             num_warps = 4
+     else:
+-        if _is_cuda and CUDA_CAPABILITY[0] == 12:
++        if _is_cuda and tuple(CUDA_CAPABILITY) == (12, 1) and Lq == 192 and Lv == 128:
++            # GB10 (DGX Spark), MiMo-V2 d_qk=192/d_v=128: prefill attention over a long prefix is
++            # bound by KV bytes per query row; a 128-row tile (2 stages) still fits the 99 KB of
++            # shared memory and halves the KV traffic: 16 -> 33 TFLOPS on an 8K chunk at 64K prefix.
++            BLOCK_M, BLOCK_N = (128, 64)
++        elif _is_cuda and CUDA_CAPABILITY[0] == 12:
+             # sm120 workstation Blackwell architecture (RTX Pro 6000) has a much smaller shared memory size (100K)
+             if Lq <= 128:
+                 BLOCK_M, BLOCK_N = (64, 128)
+@@ -152,6 +157,8 @@
+ def _get_num_stages_for_extend_attention(
+     Lq: int, Lv: int, block_n: int | None = None
+ ) -> int:
++    if _is_cuda and tuple(CUDA_CAPABILITY) == (12, 1) and Lq == 192 and Lv == 128:
++        return 2
+     if _is_gfx95 and Lq == 192 and Lv == 128:
+         return 2
+     if (

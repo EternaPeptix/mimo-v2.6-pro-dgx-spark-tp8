@@ -1,0 +1,24 @@
+--- a/python/sglang/srt/layers/logits_processor.py
++++ b/python/sglang/srt/layers/logits_processor.py
+@@ -958,6 +958,21 @@
+         lm_head: VocabParallelEmbedding,
+         embedding_bias: Optional[torch.Tensor] = None,
+     ) -> torch.Tensor:
++        fp8 = getattr(lm_head, "_fp8_draft", None)
++        if (
++            fp8 is not None
++            and embedding_bias is None
++            and hidden_states.dim() == 2
++            and 0 < hidden_states.shape[0] <= 8
++        ):
++            # draft-only FP8 head (see MiMoV2MTP._build_fp8_head); decode-sized rows only
++            from sglang.srt.layers.quantization.fp8 import _skinny_fp8_ext
++
++            ext = _skinny_fp8_ext()
++            if ext is not None and ext.fits(hidden_states.shape[0], hidden_states.shape[1]):
++                x = hidden_states.to(torch.bfloat16).contiguous()
++                logits = ext.skinny_gemm_fp8(x, fp8[0], fp8[1], 1 if x.shape[0] <= 2 else 0)
++                return logits.float() if self.use_fp32_lm_head else logits
+         quant_method = getattr(lm_head, "quant_method", None)
+         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
+             # This is a LoRA-wrapped module, use its forward method

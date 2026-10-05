@@ -1,0 +1,55 @@
+--- a/python/sglang/srt/distributed/parallel_state.py
++++ b/python/sglang/srt/distributed/parallel_state.py
+@@ -545,6 +545,32 @@
+                 group=self.cpu_group,
+                 device=self.device,
+             )
++
++        # One-shot RDMA all-reduce for small bf16 messages across nodes (one GPU per node).
++        # Opt-in via SGLANG_RDMA_AR=1; the extension lives in $RDMA_AR_DIR (default /rdma_ar).
++        self.rdma_ar = None
++        if (
++            group_name == "tp"
++            and self.world_size > 1
++            and os.environ.get("SGLANG_RDMA_AR", "0") == "1"
++        ):
++            try:
++                rdma_dir = os.environ.get("RDMA_AR_DIR", "/rdma_ar")
++                if rdma_dir not in sys.path:
++                    sys.path.insert(0, rdma_dir)
++                from rdma_ar import RdmaAllReduce
++
++                self.rdma_ar = RdmaAllReduce(
++                    self.cpu_group, self.rank_in_group, self.world_size, self.device
++                )
++                logger.info(
++                    "[AR] RDMA one-shot all-reduce enabled for group %s (<= %d bytes)",
++                    self.unique_name,
++                    self.rdma_ar.max_bytes,
++                )
++            except Exception as e:
++                logger.warning("[AR] RDMA all-reduce unavailable, using NCCL: %s", e)
++                self.rdma_ar = None
+ 
+         # Create communicator for other hardware backends
+         from sglang.srt.distributed.device_communicators.hpu_communicator import (
+@@ -731,6 +757,9 @@
+         if self.npu_communicator is not None and not self.npu_communicator.disabled:
+             return self.npu_communicator.all_reduce(input_)
+ 
++        if self.rdma_ar is not None and self.rdma_ar.should_use(input_):
++            return self.rdma_ar.all_reduce(input_)
++
+         if torch.compiler.is_compiling():
+             if self._can_use_flashinfer_allreduce(input_):
+                 return flashinfer_allreduce(input_, group_name=self.unique_name)
+@@ -1361,6 +1390,9 @@
+         return envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+ 
+     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
++        if self.rdma_ar is not None and self.rdma_ar.should_gather(output, input):
++            self.rdma_ar.all_gather_into(output, input)
++            return
+         if _is_npu or _is_cpu:
+             # TODO: add optimized all_gather_into_tensor kernel for cpu
+             self._all_gather_into_tensor(output, input)

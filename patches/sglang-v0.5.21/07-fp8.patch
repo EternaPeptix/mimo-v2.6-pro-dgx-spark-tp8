@@ -1,0 +1,77 @@
+--- a/python/sglang/srt/layers/quantization/fp8.py
++++ b/python/sglang/srt/layers/quantization/fp8.py
+@@ -5,6 +5,7 @@
+ from __future__ import annotations
+ 
+ import logging
++import os
+ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+ 
+ import torch
+@@ -178,6 +179,32 @@
+ ACTIVATION_SCHEMES = ["static", "dynamic"]
+ 
+ logger = logging.getLogger(__name__)
++
++
++_SKINNY_FP8 = None
++
++
++def _skinny_fp8_ext():
++    """Decode-sized W8A16 GEMM for block-quantized FP8 linears (skinny_gemm.cu, opt-in via
++    SGLANG_SKINNY_FP8=1): dequantizes 16 fp8 per 16-byte load and keeps x in shared memory.
++    ~15% faster than Triton W8A8 and Marlin FP8 at M <= 4 on GB10, and exact in the weights
++    (no activation quantization)."""
++    global _SKINNY_FP8
++    if _SKINNY_FP8 is None:
++        _SKINNY_FP8 = False
++        if os.environ.get("SGLANG_SKINNY_FP8", "0") == "1":
++            try:
++                import sys as _sys
++
++                d = os.environ.get("SKINNY_GEMM_DIR", "/skinny/build")
++                if d not in _sys.path:
++                    _sys.path.insert(0, d)
++                import skinny_gemm_ext
++
++                _SKINNY_FP8 = skinny_gemm_ext if hasattr(skinny_gemm_ext, "skinny_gemm_fp8") else False
++            except Exception as e:
++                logger.warning("skinny_gemm_fp8 unavailable: %s", e)
++    return _SKINNY_FP8 or None
+ 
+ DSV4_DEQUANT_FP4_TABLE = torch.tensor(
+     [
+@@ -1243,6 +1270,33 @@
+                     bias=bias,
+                 )
+ 
++            ext = _skinny_fp8_ext()
++            if (
++                ext is not None
++                and x.is_cuda
++                and x.dtype == torch.bfloat16
++                and x.numel() // x.shape[-1] <= 8
++                and list(self.weight_block_size) == [128, 128]
++                and layer.weight.dtype == torch.float8_e4m3fn
++                and layer.weight.dim() == 2
++                and layer.weight.is_contiguous()
++                and layer.weight_scale_inv.dtype == torch.float32
++                and layer.weight_scale_inv.dim() == 2
++                and layer.weight_scale_inv.is_contiguous()
++                and layer.weight.shape[1] % 128 == 0
++                and layer.weight_scale_inv.shape[0] == (layer.weight.shape[0] + 127) // 128
++                and layer.weight_scale_inv.shape[1] == layer.weight.shape[1] // 128
++                and ext.fits(x.numel() // x.shape[-1], x.shape[-1])
++                and not torch.compiler.is_compiling()
++            ):
++                x2 = x.reshape(-1, x.shape[-1]).contiguous()
++                m, k = x2.shape
++                variant = 1 if (m <= 2 or k < 4096) else 0
++                y = ext.skinny_gemm_fp8(x2, layer.weight, layer.weight_scale_inv, variant)
++                if bias is not None:
++                    y = y + bias
++                return y.reshape(*x.shape[:-1], y.shape[-1])
++
+             return self.w8a8_block_fp8_linear(
+                 input=x,
+                 weight=layer.weight,

@@ -1,0 +1,24 @@
+--- a/python/sglang/kernels/ops/attention/verify_mla.py
++++ b/python/sglang/kernels/ops/attention/verify_mla.py
+@@ -18,8 +18,8 @@
+ 
+ from sglang.kernels.ops.attention.verify_splitkv import _AMD_LAUNCH_KWARGS
+ 
+-MAX_N_SPLITS = 32  # Grid split dim upper bound
+-TARGET_PROGRAMS = 512  # Target total stage-1 programs
++MAX_N_SPLITS = 96  # Grid split dim upper bound (GB10: 96 splits x 1 head block ~ 2 programs/SM)
++TARGET_PROGRAMS = 1024  # Target total stage-1 programs
+ 
+ DEFAULT_BLOCK_H = (
+     4  # BLOCK_H must be a power of 2 (tl.arange); heads beyond H_Q are masked.
+@@ -31,6 +31,10 @@
+     256: (4, 64, 8),  # Qwen3.5 TP2 / TP4 / TP8
+     576: (4, 64, 8),  # K3 MLA (kv_lora_rank 512 + qk_rope 64)
+     64: (4, 256, 4),  # K3 GQA (dspark draft attention)
++    # MiMo-V2 full attention on TP8 (16 q heads share one KV head, d_qk=192, d_v=128): one head
++    # block reads each KV tile once; measured 234 GB/s at 1M context on GB10 vs 6 GB/s for the
++    # serial-prefix extend kernel.
++    192: (16, 64, 4),
+ }
+ 
+ 

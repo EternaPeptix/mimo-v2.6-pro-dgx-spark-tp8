@@ -1,0 +1,10 @@
+MiMo-V2.6-Pro on 8x DGX Spark
+Copyright 2026 EternaPeptix
+
+This repository includes modifications to SGLang (https://github.com/sgl-project/sglang),
+Copyright the SGLang authors, licensed under the Apache License, Version 2.0.
+The files in patches/sglang-v0.5.21/ are unified diffs against SGLang v0.5.21 source files;
+patch 02 adds a new file (python/sglang/kernels/ops/attention/swa_verify.py).
+
+The model weights (XiaomiMiMo/MiMo-V2.6-Pro-MOPD) are not part of this repository; see the model card
+for their license.

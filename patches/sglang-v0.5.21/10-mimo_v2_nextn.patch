@@ -1,0 +1,92 @@
+--- a/python/sglang/srt/models/mimo_v2_nextn.py
++++ b/python/sglang/srt/models/mimo_v2_nextn.py
+@@ -13,6 +13,7 @@
+ # ==============================================================================
+ 
+ import logging
++import os
+ from typing import Iterable, Optional, Tuple
+ 
+ import torch
+@@ -32,6 +33,7 @@
+ )
+ from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+ from sglang.srt.layers.layernorm import RMSNorm
++from sglang.srt.layers.linear import ColumnParallelLinear
+ from sglang.srt.layers.logits_processor import LogitsProcessor
+ from sglang.srt.layers.quantization.base_config import QuantizationConfig
+ from sglang.srt.layers.vocab_parallel_embedding import (
+@@ -185,7 +187,21 @@
+         self.enorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
+         self.hnorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
+ 
+-        self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
++        # eh_proj is a 2H -> H bf16 projection (151 MB for MiMo-V2) that every TP rank used to read in
++        # full on each draft step. Column-parallel + gathered output reads 1/tp of it per rank; the
++        # tiny output all-gather rides the TP group's all-gather. SGLANG_MTP_SHARD_EH_PROJ=0 restores
++        # the replicated nn.Linear.
++        if os.environ.get("SGLANG_MTP_SHARD_EH_PROJ", "1") == "1":
++            self.eh_proj = ColumnParallelLinear(
++                2 * config.hidden_size,
++                config.hidden_size,
++                bias=False,
++                gather_output=True,
++                quant_config=None,
++                prefix=add_prefix("eh_proj", prefix),
++            )
++        else:
++            self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+ 
+         self.mtp_block = MiMoV2MTPLayer(
+             config,
+@@ -221,6 +237,8 @@
+                     dim=-1,
+                 )
+             )
++            if isinstance(hidden_states, tuple):  # ColumnParallelLinear returns (out, bias)
++                hidden_states = hidden_states[0]
+         residual_batch.start(forward_batch)
+         hidden_states = self.mtp_block(
+             positions=positions,
+@@ -362,6 +380,33 @@
+                         weight_loader(param, loaded_weight)
+                 else:
+                     logger.warning(f"Parameter {name} not found in params_dict")
++
++        self._build_fp8_head()
++
++    def _build_fp8_head(self):
++        """FP8 copy of the draft lm_head (SGLANG_MTP_FP8_HEAD=1). The draft only proposes tokens and the
++        target verifies every one, so a lower-precision head cannot change outputs, only acceptance; it
++        halves the 234 MB/rank head read of each of the three draft steps. 128x128 blocks, amax scaling."""
++        if os.environ.get("SGLANG_MTP_FP8_HEAD", "0") != "1":
++            return
++        w = getattr(self.lm_head, "weight", None)
++        if w is None or w.dim() != 2 or w.dtype not in (torch.bfloat16, torch.float16) or w.shape[1] % 128:
++            return
++        prev = getattr(self.lm_head, "_fp8_draft_src", None)
++        if prev == w.data_ptr():
++            return
++        with torch.no_grad():
++            n, k = w.shape
++            nb = (n + 127) // 128
++            wp = torch.nn.functional.pad(w.float(), (0, 0, 0, nb * 128 - n))
++            blocks = wp.view(nb, 128, k // 128, 128)
++            scale = (blocks.abs().amax(dim=(1, 3)).clamp(min=1e-8) / 448.0).contiguous()
++            q = (blocks / scale[:, None, :, None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
++            q = q.view(nb * 128, k)[:n].contiguous()
++            del wp, blocks
++        self.lm_head._fp8_draft = (q, scale)
++        self.lm_head._fp8_draft_src = w.data_ptr()
++        logger.info("MTP draft lm_head: FP8 copy built %s (scale %s)", tuple(q.shape), tuple(scale.shape))
+ 
+     def map_model_name_to_mtp_param_name(self, name: str) -> str:
+         import re
+@@ -393,6 +438,7 @@
+         del self.lm_head.weight
+         self.model.embed_tokens.weight = embed
+         self.lm_head.weight = head
++        self._build_fp8_head()
+         torch.cuda.empty_cache()
+         torch.cuda.synchronize()
+ 

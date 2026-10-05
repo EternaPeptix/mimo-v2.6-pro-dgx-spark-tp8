@@ -1,0 +1,66 @@
+--- a/python/sglang/srt/layers/quantization/unquant.py
++++ b/python/sglang/srt/layers/quantization/unquant.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import logging
++import os
+ from enum import Enum
+ from typing import TYPE_CHECKING, Callable, List, Optional
+ 
+@@ -429,6 +430,30 @@
+         return F.embedding(input_, layer.weight)
+ 
+ 
++_SKINNY_EXT = None
++
++
++def _skinny_gemm_ext():
++    """Decode-sized bf16 GEMM (skinny_gemm.cu, opt-in via SGLANG_SKINNY_GEMM=1): streams W with
++    16-byte loads and keeps x in shared memory; ~10-28% faster than cuBLAS on GB10 for M <= 4."""
++    global _SKINNY_EXT
++    if _SKINNY_EXT is None:
++        _SKINNY_EXT = False
++        if os.environ.get("SGLANG_SKINNY_GEMM", "0") == "1":
++            try:
++                import sys as _sys
++
++                d = os.environ.get("SKINNY_GEMM_DIR", "/skinny/build")
++                if d not in _sys.path:
++                    _sys.path.insert(0, d)
++                import skinny_gemm_ext
++
++                _SKINNY_EXT = skinny_gemm_ext
++            except Exception as e:  # fall back to the stock GEMM
++                logger.warning("skinny_gemm unavailable: %s", e)
++    return _SKINNY_EXT or None
++
++
+ class UnquantizedLinearMethod(LinearMethodBase):
+     """Linear method without quantization."""
+ 
+@@ -482,6 +507,24 @@
+             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
+ 
+         elif (
++            bias is None
++            and x.dim() == 2
++            and x.shape[0] <= 8
++            and x.is_cuda
++            and x.dtype == torch.bfloat16
++            and layer.weight.dtype == torch.bfloat16
++            and layer.weight.dim() == 2
++            and x.is_contiguous()
++            and layer.weight.is_contiguous()
++            and not torch.compiler.is_compiling()
++            and _skinny_gemm_ext() is not None
++            and _skinny_gemm_ext().fits(x.shape[0], x.shape[1])
++        ):
++            # variant 1 (split-K, 1 row/warp) wins for M <= 4 at K <= 4096; variant 0 otherwise
++            variant = 1 if (x.shape[0] <= 4 and x.shape[1] <= 4096) else 0
++            return _skinny_gemm_ext().skinny_gemm(x, layer.weight, variant)
++
++        elif (
+             get_bf16_gemm_backend().is_cutedsl()
+             and x.is_cuda
+             and x.dtype == torch.bfloat16

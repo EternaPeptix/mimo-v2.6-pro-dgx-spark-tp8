@@ -1,0 +1,191 @@
+--- /dev/null
++++ b/python/sglang/kernels/ops/attention/swa_verify.py
+@@ -0,0 +1,188 @@
++"""Sliding-window (+ attention sink) EAGLE target-verify attention, topk == 1.
++
++The Triton extend kernel serves the verify step of sliding-window layers with one program per
++(query block, head) that walks the window tile by tile and then the draft tokens, each step a
++dependent chain of index -> K -> V loads. On GB10 every link in that chain can be a TLB miss into
++the multi-GB KV pool, so a 4-token verify over a 128-key window costs ~28 us per layer (60 such
++layers per MiMo-V2 verify step). Here each program covers BLOCK_H heads x all draft tokens and
++issues every index, K and V load of the window (two 64-key tiles) and of the draft block up front:
++~3 dependent memory round trips per layer.
++
++Semantics match ``extend_attention_fwd`` for this case:
++  * prefix keys come from the per-request window list (``window_kv_indptr/indices``); draft row i
++    sees window key n iff ``n >= i + wlen - W`` (q_pos <= k_pos + W, positions relative to the
++    window start), where wlen is the list length and W the sliding window size (<= 128)
++  * draft keys (k_extend / v_extend) are causal: row i sees draft key j iff j <= i
++  * a sink adds exp(sink[h] - max) to the softmax denominator only
++"""
++
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _qk(qa, qb, ka, kb, HAS_B: tl.constexpr):
++    s = tl.dot(qa, ka, out_dtype=tl.float32)
++    if HAS_B:
++        s += tl.dot(qb, kb, out_dtype=tl.float32)
++    return s
++
++
++@triton.jit
++def _swa_verify_kernel(
++    Q, K_Ext, V_Ext, K_Buf, V_Buf, O, Sinks,
++    qo_indptr, win_indptr, win_indices,
++    sm_scale,
++    stride_qt, stride_qh,
++    stride_ket, stride_keh,
++    stride_vet, stride_veh,
++    stride_kbt, stride_kbh,
++    stride_vbt, stride_vbh,
++    stride_ot, stride_oh,
++    W: tl.constexpr,
++    L_PAD: tl.constexpr,
++    J_PAD: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++    KV_GROUP: tl.constexpr,
++    DA: tl.constexpr,
++    DB: tl.constexpr,
++    DV: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    HAS_SINK: tl.constexpr,
++):
++    b = tl.program_id(0)
++    hb = tl.program_id(1)
++    R: tl.constexpr = BLOCK_H * L_PAD
++    HAS_B: tl.constexpr = DB > 0
++    DBP: tl.constexpr = DB if DB > 0 else 16
++    offs_r = tl.arange(0, R)
++    h = hb * BLOCK_H + offs_r // L_PAD  # query head of each row
++    i = offs_r % L_PAD  # draft token of each row
++    kv_head = (hb * BLOCK_H) // KV_GROUP  # every head in the block shares one KV head
++    offs_a = tl.arange(0, DA)
++    offs_b = DA + tl.arange(0, DBP)
++    offs_dv = tl.arange(0, DV)
++
++    # level 1: request bounds
++    q_start = tl.load(qo_indptr + b)
++    l_ext = tl.load(qo_indptr + b + 1) - q_start
++    w_start = tl.load(win_indptr + b)
++    wlen = tl.load(win_indptr + b + 1) - w_start
++
++    # level 2: queries, draft K/V, window indices
++    row_ok = i < l_ext
++    q_row = (q_start + i)[:, None] * stride_qt + h[:, None] * stride_qh
++    qa = tl.load(Q + q_row + offs_a[None, :], mask=row_ok[:, None], other=0.0)
++    qb = tl.load(Q + q_row + offs_b[None, :], mask=row_ok[:, None] & HAS_B, other=0.0)
++    offs_j = tl.arange(0, J_PAD)
++    j_ok = offs_j < l_ext
++    ke_col = (q_start + offs_j)[None, :] * stride_ket + kv_head * stride_keh
++    kea = tl.load(K_Ext + ke_col + offs_a[:, None], mask=j_ok[None, :], other=0.0)
++    keb = tl.load(K_Ext + ke_col + offs_b[:, None], mask=j_ok[None, :] & HAS_B, other=0.0)
++    ve = tl.load(V_Ext + (q_start + offs_j)[:, None] * stride_vet + kv_head * stride_veh + offs_dv[None, :],
++                 mask=j_ok[:, None], other=0.0)
++    offs_n0 = tl.arange(0, BLOCK_N)
++    offs_n1 = BLOCK_N + tl.arange(0, BLOCK_N)
++    ok0 = offs_n0 < wlen
++    ok1 = offs_n1 < wlen
++    loc0 = tl.load(win_indices + w_start + offs_n0, mask=ok0, other=0)
++    loc1 = tl.load(win_indices + w_start + offs_n1, mask=ok1, other=0)
++
++    # level 3: window K/V
++    kb0 = loc0[None, :] * stride_kbt + kv_head * stride_kbh
++    kb1 = loc1[None, :] * stride_kbt + kv_head * stride_kbh
++    k0a = tl.load(K_Buf + kb0 + offs_a[:, None], mask=ok0[None, :], other=0.0)
++    k0b = tl.load(K_Buf + kb0 + offs_b[:, None], mask=ok0[None, :] & HAS_B, other=0.0)
++    k1a = tl.load(K_Buf + kb1 + offs_a[:, None], mask=ok1[None, :], other=0.0)
++    k1b = tl.load(K_Buf + kb1 + offs_b[:, None], mask=ok1[None, :] & HAS_B, other=0.0)
++    v0 = tl.load(V_Buf + loc0[:, None] * stride_vbt + kv_head * stride_vbh + offs_dv[None, :],
++                 mask=ok0[:, None], other=0.0)
++    v1 = tl.load(V_Buf + loc1[:, None] * stride_vbt + kv_head * stride_vbh + offs_dv[None, :],
++                 mask=ok1[:, None], other=0.0)
++
++    # scores for the whole window + draft block, then one exact softmax
++    s0 = _qk(qa, qb, k0a, k0b, HAS_B) * sm_scale
++    s1 = _qk(qa, qb, k1a, k1b, HAS_B) * sm_scale
++    sd = _qk(qa, qb, kea, keb, HAS_B) * sm_scale
++    lo = i[:, None] + wlen - W
++    s0 = tl.where(row_ok[:, None] & ok0[None, :] & (offs_n0[None, :] >= lo), s0, float("-inf"))
++    s1 = tl.where(row_ok[:, None] & ok1[None, :] & (offs_n1[None, :] >= lo), s1, float("-inf"))
++    sd = tl.where(row_ok[:, None] & j_ok[None, :] & (offs_j[None, :] <= i[:, None]), sd, float("-inf"))
++    m = tl.maximum(tl.maximum(tl.max(s0, 1), tl.max(s1, 1)), tl.max(sd, 1))
++    m = tl.where(m == float("-inf"), -1e20, m)
++    p0 = tl.exp(s0 - m[:, None])
++    p1 = tl.exp(s1 - m[:, None])
++    pd = tl.exp(sd - m[:, None])
++    deno = tl.sum(p0, 1) + tl.sum(p1, 1) + tl.sum(pd, 1)
++    acc = tl.dot(p0.to(v0.dtype), v0)
++    acc += tl.dot(p1.to(v1.dtype), v1)
++    acc += tl.dot(pd.to(ve.dtype), ve)
++    if HAS_SINK:
++        deno += tl.exp(tl.load(Sinks + h).to(tl.float32) - m)
++    out = acc / deno[:, None]
++    tl.store(O + (q_start + i)[:, None] * stride_ot + h[:, None] * stride_oh + offs_dv[None, :],
++             out.to(O.dtype.element_ty), mask=row_ok[:, None])
++
++
++def can_handle(q_extend, k_extend, v_extend, max_len_extend, sliding_window_size, qo_indptr):
++    if sliding_window_size is None or sliding_window_size <= 0 or sliding_window_size > 128:
++        return False  # two 64-key window tiles
++    if q_extend.dim() != 3 or k_extend.dim() != 3 or v_extend.dim() != 3:
++        return False
++    h_q, h_kv = q_extend.shape[1], k_extend.shape[1]
++    if h_kv == 0 or h_q % h_kv != 0:
++        return False
++    d, dv = q_extend.shape[2], v_extend.shape[2]
++    if d not in (64, 128, 192, 256) or dv & (dv - 1) or dv < 16:
++        return False
++    try:
++        mle = int(max_len_extend)
++    except (TypeError, ValueError):
++        return False
++    if mle < 1 or mle > 16:
++        return False
++    bs = qo_indptr.shape[0] - 1
++    return bs >= 1 and q_extend.shape[0] == bs * mle
++
++
++def swa_verify_fwd(q_extend, k_extend, v_extend, o_extend, k_buffer, v_buffer, qo_indptr,
++                   window_kv_indptr, window_kv_indices, max_len_extend, sliding_window_size,
++                   sm_scale, sinks=None):
++    """Returns True if it wrote o_extend; False means the caller falls back to extend_attention_fwd."""
++    if not can_handle(q_extend, k_extend, v_extend, max_len_extend, sliding_window_size, qo_indptr):
++        return False
++    bs = qo_indptr.shape[0] - 1
++    h_q, h_kv = q_extend.shape[1], k_extend.shape[1]
++    d, dv = q_extend.shape[2], v_extend.shape[2]
++    kv_group = h_q // h_kv
++    block_h = 4
++    while kv_group % block_h:
++        block_h //= 2
++    l = int(max_len_extend)
++    l_pad = max(triton.next_power_of_2(l), triton.cdiv(16, block_h))
++    da = 128 if d >= 128 else d
++    _swa_verify_kernel[(bs, h_q // block_h)](
++        q_extend, k_extend, v_extend, k_buffer, v_buffer, o_extend,
++        sinks if sinks is not None else q_extend,
++        qo_indptr, window_kv_indptr, window_kv_indices,
++        sm_scale,
++        q_extend.stride(0), q_extend.stride(1),
++        k_extend.stride(0), k_extend.stride(1),
++        v_extend.stride(0), v_extend.stride(1),
++        k_buffer.stride(0), k_buffer.stride(1),
++        v_buffer.stride(0), v_buffer.stride(1),
++        o_extend.stride(0), o_extend.stride(1),
++        W=int(sliding_window_size),
++        L_PAD=l_pad,
++        J_PAD=max(16, triton.next_power_of_2(l)),
++        BLOCK_H=block_h,
++        KV_GROUP=kv_group,
++        DA=da,
++        DB=d - da,
++        DV=dv,
++        BLOCK_N=64,
++        HAS_SINK=sinks is not None,
++        num_warps=4,
++        num_stages=1,
++    )
++    return True

@@ -1,0 +1,167 @@
+--- a/python/sglang/srt/layers/attention/triton_backend.py
++++ b/python/sglang/srt/layers/attention/triton_backend.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import os
+ from dataclasses import dataclass
+ from typing import TYPE_CHECKING, List, Optional
+ 
+@@ -85,6 +86,28 @@
+     return max(base_max_kv_splits, min(sm_cap, ctx_cap))
+ 
+ 
++# --- decode-at-long-context measurement mode (SGLANG_FAKE_VERIFY_CTX_FILE=1) -------------------
++# When /tmp/fake_verify_ctx holds N > 0, single-request target-verify steps make the full-attention
++# layers attend over N consecutive slots of the real KV pool instead of the request's own prefix: the
++# same KV bytes and kernel work as an N-token context, without an N-token prefill. Outputs are
++# meaningless while it is on; it exists only to time decode at long context.
++_FAKE_CTX = {"n": 0, "calls": 0, "filled": 0}
++
++
++def _fake_verify_ctx() -> int:
++    if os.environ.get("SGLANG_FAKE_VERIFY_CTX_FILE", "0") != "1":
++        return 0
++    c = _FAKE_CTX
++    c["calls"] += 1
++    if c["calls"] % 32 == 1:
++        try:
++            with open("/tmp/fake_verify_ctx") as f:
++                c["n"] = int(f.read().strip() or 0)
++        except (OSError, ValueError):
++            c["n"] = 0
++    return c["n"]
++
++
+ def _should_use_verify_shared_kv(model_config, topk, use_mla, use_verify_splitkv):
+     if not is_gfx95_supported() or topk != 1:
+         return False
+@@ -171,6 +194,7 @@
+             extend_attention_fwd_unified,
+         )
+         from sglang.kernels.ops.attention.verify_mla import verify_shared_kv_fwd
++        from sglang.kernels.ops.attention.swa_verify import swa_verify_fwd
+         from sglang.kernels.ops.attention.verify_splitkv import verify_splitkv_fwd
+ 
+         super().__init__()
+@@ -199,6 +223,9 @@
+         self.verify_splitkv_fwd = torch.compiler.disable(verify_splitkv_fwd)
+         # Grouped-head split-KV verify kernel for MLA or one shared local KV head.
+         self.verify_shared_kv_fwd = torch.compiler.disable(verify_shared_kv_fwd)
++        # Sliding-window(+sink) verify kernel (topk == 1): one program per head block x all draft
++        # tokens, loads hoisted; ~3x faster than extend_attention_fwd for a 128-key window.
++        self.swa_verify_fwd = torch.compiler.disable(swa_verify_fwd)
+ 
+         # Parse args
+         self.skip_prefill = skip_prefill
+@@ -238,6 +265,26 @@
+             self.use_mla,
+             self.use_verify_splitkv,
+         )
++        # CUDA: the grouped-head split-KV verify kernel is plain Triton and serves any non-MLA
++        # GQA layer whose TP-local KV heads form power-of-two groups (verify_mla.can_handle checks
++        # shapes per call; sink / sliding-window layers fall back to extend_attention_fwd). On
++        # GB10 the serial-prefix extend kernel streams the prefix at ~6 GB/s for a 4-token verify,
++        # which makes long-context decode ~40x slower than the KV read. SGLANG_VERIFY_SHARED_KV=0
++        # restores the stock path.
++        if (
++            not self.use_verify_shared_kv
++            and not is_hip()
++            and self.topk == 1
++            and not self.use_mla
++            and get_bool_env_var("SGLANG_VERIFY_SHARED_KV", "true")
++        ):
++            self.use_verify_shared_kv = True
++        self.use_swa_verify = (
++            not is_hip()
++            and self.topk == 1
++            and not self.use_mla
++            and get_bool_env_var("SGLANG_SWA_VERIFY", "true")
++        )
+         # TODO: this logic should be fixed in non-hip platform
+         self.is_hip_dspark_draft = (
+             _is_hip
+@@ -584,6 +631,15 @@
+         kv_indptr = self._fill_kv_indptr_and_indices(
+             bs, seq_lens, req_pool_indices, self.cuda_graph_kv_indices
+         )
++        fake = _fake_verify_ctx() if bs == 1 else 0
++        if fake > 0:
++            n = min(fake, self.cuda_graph_kv_indices.numel(), self.token_to_kv_pool.size - 1)
++            if _FAKE_CTX["filled"] < n:  # slots 1..n of the pool (0 is the padding slot)
++                self.cuda_graph_kv_indices[:n] = torch.arange(
++                    1, n + 1, dtype=self.cuda_graph_kv_indices.dtype, device=self.device
++                )
++                _FAKE_CTX["filled"] = n
++            kv_indptr[1] = n  # the real refill above only rewrote the first seq_len entries
+         window_kv_indptr = self.window_kv_indptr
+         window_kv_indices = None
+         window_num_kv_splits = None
+@@ -696,6 +752,20 @@
+         kv_indptr = self._fill_kv_indptr_and_indices(
+             bs, kv_lens, req_pool_indices, self.cuda_graph_kv_indices
+         )
++        # SWA draft models (e.g. MiMo-V2 MTP): the extend kernel reads the
++        # window buffers for sliding-window layers, so fill them from the same
++        # prefix lens, mirroring the eager extend path.
++        if self.sliding_window_size is not None and self.sliding_window_size > 0:
++            update_sliding_window_buffer(
++                self.window_kv_indptr,
++                self.kv_index_translator,
++                req_pool_indices,
++                self.sliding_window_size,
++                kv_lens,
++                bs,
++                token_to_kv_pool=self.token_to_kv_pool,
++                window_kv_indices=self.cuda_graph_window_kv_indices,
++            )
+         return qo_indptr, kv_indptr, num_tokens_per_req
+ 
+     def init_forward_metadata_out_graph(
+@@ -1296,8 +1366,10 @@
+                 qo_indptr=self.qo_indptr[: bs + 1],
+                 custom_mask=None,
+                 mask_indptr=None,
+-                window_kv_indptr=self.window_kv_indptr,
+-                window_kv_indices=None,
++                window_kv_indptr=(
++                    self.window_kv_indptr[: bs + 1] if swa else self.window_kv_indptr
++                ),
++                window_kv_indices=self.cuda_graph_window_kv_indices if swa else None,
+                 window_num_kv_splits=None,
+                 window_kv_offsets=None,
+                 swa_out_cache_loc=swa_out_cache_loc,
+@@ -1755,6 +1827,33 @@
+         else:
+             verify_fwd = None
+         if (
++            self.use_swa_verify
++            and score_mod is None
++            and sliding_window_size > 0
++            and forward_batch.forward_mode.is_target_verify()
++            and not logits_soft_cap
++            and k_descale == 1.0
++            and v_descale == 1.0
++            and (layer.xai_temperature_len is None or layer.xai_temperature_len <= 0)
++            and self.swa_verify_fwd(
++                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
++                k.contiguous(),
++                v.contiguous(),
++                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
++                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
++                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
++                self.forward_metadata.qo_indptr,
++                kv_indptr,
++                kv_indices,
++                self.forward_metadata.max_extend_len,
++                sliding_window_size,
++                layer.scaling,
++                sinks=sinks,
++            )
++        ):
++            return o
++
++        if (
+             verify_fwd is not None
+             and score_mod is None
+             and forward_batch.forward_mode.is_target_verify()

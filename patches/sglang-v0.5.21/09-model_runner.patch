@@ -1,0 +1,51 @@
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -18,6 +18,7 @@
+ import contextlib
+ import inspect
+ import logging
++import os
+ import time
+ from dataclasses import dataclass
+ from typing import Callable, List, Optional, Union
+@@ -651,6 +652,20 @@
+         self.maybe_init_elastic_ep()
+         self.init_token_oracle()
+         self.sampler = create_sampler()
++        # Prefill activation reserve (SGLANG_PREFILL_POOL_GB): on GB10 the GPU allocates from system
++        # RAM, and buffers created after weight loading has fragmented free memory end up on small
++        # pages (the 8K-token MoE buffers then run 2-8x slower on that rank, stalling the TP group).
++        # Reserve a private pool now, while memory is contiguous, and run prefill inside it.
++        self._prefill_pool = None
++        self._prefill_pool_hold = None
++        _reserve_gb = float(os.environ.get("SGLANG_PREFILL_POOL_GB", "0") or 0)
++        if _reserve_gb > 0 and not self.is_draft_worker and torch.cuda.is_available():
++            self._prefill_pool = torch.cuda.MemPool()
++            with torch.cuda.use_mem_pool(self._prefill_pool):
++                self._prefill_pool_hold = torch.empty(
++                    int(_reserve_gb * (1 << 30)), dtype=torch.uint8, device=self.device
++                )
++            logger.info(f"Reserved {_reserve_gb:.1f} GB prefill activation pool")
+         self.load_model()
+         prepare_moe_topk(model=self.model, model_config=self.model_config)
+ 
+@@ -1940,6 +1955,19 @@
+                         forward_batch, **kwargs
+                     )
+                 can_run_graph = True
++            elif (
++                getattr(self, "_prefill_pool", None) is not None
++                and forward_batch.forward_mode.is_extend()
++                and not forward_batch.forward_mode.is_target_verify()
++                and forward_batch.input_ids is not None
++                and forward_batch.input_ids.shape[0] >= 256
++            ):
++                # Large eager prefill: allocate activations from the reserved pool (see initialize).
++                self._prefill_pool_hold = None
++                with torch.cuda.use_mem_pool(self._prefill_pool):
++                    ret = self.eager_runner.execute(
++                        forward_batch, pp_proxy_tensors=pp_proxy_tensors
++                    )
+             else:
+                 # Eager: decode / extend / idle dispatched inside the runner.
+                 ret = self.eager_runner.execute(
